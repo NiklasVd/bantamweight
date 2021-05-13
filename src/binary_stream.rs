@@ -10,7 +10,7 @@ pub enum BinaryStreamMode {
 
 pub struct BinaryStream {
     pub mode: BinaryStreamMode,
-    pub buffer: VecDeque<u8>
+    buffer: VecDeque<u8>
 }
 
 fn collect_array<T, I, const N: usize>(itr: I) -> [T; N]
@@ -28,18 +28,16 @@ where
 
 impl BinaryStream {
     pub fn new() -> BinaryStream {
-        BinaryStream::with_capacity(None)
-    }
-
-    pub fn with_capacity(expected_size: Option<usize>) -> BinaryStream {
-        let buffer = match expected_size {
-            Some(size) => VecDeque::with_capacity(size),
-            None => VecDeque::new()
-        };
-
         BinaryStream {
             mode: BinaryStreamMode::Write,
-            buffer
+            buffer: VecDeque::new()
+        }
+    }
+
+    pub fn with_capacity(expected_size: usize) -> BinaryStream {
+        BinaryStream {
+            mode: BinaryStreamMode::Write,
+            buffer: VecDeque::with_capacity(expected_size)
         }
     }
 
@@ -61,6 +59,20 @@ impl BinaryStream {
         self.buffer.len()
     }
 
+    pub fn get_buffer(self) -> VecDeque<u8> {
+        self.buffer
+    }
+
+    pub fn get_buffer_vec(mut self) -> Vec<u8> {
+        self.buffer.make_contiguous().to_vec()
+    }
+
+    // Writing
+
+    pub fn write_u16(&mut self, val: u16) -> io::Result<()> {
+        self.write_buffer(&val.to_le_bytes().to_vec())
+    }
+
     pub fn write_u32(&mut self, val: u32) -> io::Result<()> {
         self.write_buffer(&val.to_le_bytes().to_vec())
     }
@@ -75,13 +87,14 @@ impl BinaryStream {
 
     pub fn write_string(&mut self, val: &String) -> io::Result<()> {
         let string_bytes = val.as_bytes();
-        self.write_u32(string_bytes.len() as u32).unwrap();
+        self.write_u32(string_bytes.len() as u32)?;
         self.write_buffer(&val.as_bytes().to_vec())
     }
 
     pub fn write_byte_vec(&mut self, val: &Vec<u8>) -> io::Result<()> {
-        self.write_u32(val.len() as u32).unwrap();
-        self.write_buffer(val)
+        self.write_u32(val.len() as u32)?;
+        self.write_buffer(val)?;
+        Ok(())
     }
 
     pub fn write_vec<T: Serializable>(&mut self, val: &Vec<T>) -> io::Result<()> {
@@ -90,8 +103,20 @@ impl BinaryStream {
         Ok(())
     }
 
-    pub fn write_packet_type(&mut self, val: PacketType) -> io::Result<()> {
-        self.write_buffer_single(val.as_byte())
+    pub fn write_packet_type<T: PacketType>(&mut self, val: T) -> io::Result<()> {
+        self.write_buffer_single(val.to_byte())
+    }
+
+    // Really needed?
+    pub fn write_buffer_size(&mut self) -> io::Result<()> {
+        self.write_u32(self.buffer.len() as u32)
+    }
+
+    // Reading
+
+    pub fn read_u16(&mut self) -> io::Result<u16> {
+        let bytes = collect_array(self.read_buffer(2)?);
+        Ok(u16::from_le_bytes(bytes))
     }
 
     pub fn read_u32(&mut self) -> io::Result<u32> {
@@ -115,7 +140,7 @@ impl BinaryStream {
     }
 
     pub fn read_byte_vec(&mut self) -> io::Result<Vec<u8>> {
-        let vec_size = self.read_buffer_single()? as usize;
+        let vec_size = self.read_u32()? as usize;
         self.read_buffer(vec_size)
     }
 
@@ -123,22 +148,28 @@ impl BinaryStream {
         let vec_size = self.read_u32()?;
         let mut vec = Vec::with_capacity(vec_size as usize);
         for _ in 0..vec_size {
-            vec.push(T::from_stream(self));
+            let t = T::from_stream(self);
+            vec.push(t);
         }
 
         Ok(vec)
     }
 
-    pub fn read_packet_type(&mut self) -> io::Result<PacketType> {
-        Ok(PacketType::from_byte(self.read_buffer_single()?).unwrap())
+    pub fn read_packet_type<T: PacketType>(&mut self) -> io::Result<T> {
+        Ok(T::from_byte(self.read_buffer_single()?).unwrap())
     }
+
+    pub fn read_buffer_size(&mut self) -> io::Result<u32> {
+        self.read_u32()
+    }
+    
+    // Abstract writing/reading
 
     pub fn write_buffer_single(&mut self, byte: u8) -> io::Result<()> {
         match self.mode {
             BinaryStreamMode::Read => Err(Error::new(io::ErrorKind::PermissionDenied, "Stream is in read-only mode")),
             BinaryStreamMode::Write => {
                 self.buffer.push_back(byte);
-                println!("Wrote 1 byte");
                 Ok(())
             }
         }
@@ -149,7 +180,6 @@ impl BinaryStream {
             BinaryStreamMode::Read => Err(Error::new(io::ErrorKind::PermissionDenied, "Stream is in read-only mode")),
             BinaryStreamMode::Write => {
                 self.buffer.extend(bytes);
-                println!("Wrote {} bytes", bytes.len());
                 Ok(())
             }
         }
@@ -159,7 +189,6 @@ impl BinaryStream {
         match self.mode {
             BinaryStreamMode::Write => Err(Error::new(io::ErrorKind::PermissionDenied, "Stream is in writing mode")),
             BinaryStreamMode::Read => {
-                println!("Read 1 byte");
                 Ok(self.buffer.pop_front().unwrap())
             }
         }

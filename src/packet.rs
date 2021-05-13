@@ -1,32 +1,8 @@
-use crate::BinaryStream;
+use crate::{BinaryStream, SerializableSocketAddr};
 
-#[derive(Debug)]
-pub enum PacketType {
-    Blockchain = 0,
-    RequestBlockchain = 1,
-    Block = 2,
-    Transaction = 3
-}
-
-impl PacketType {
-    pub fn as_byte(&self) -> u8 {
-        match self {
-            PacketType::Blockchain => 0,
-            PacketType::RequestBlockchain => 1,
-            PacketType::Block => 2,
-            PacketType::Transaction => 3
-        }
-    }
-
-    pub fn from_byte(byte: u8) -> Option<PacketType> {
-        Some(match byte {
-            0 => PacketType::Blockchain,
-            1 => PacketType::RequestBlockchain,
-            2 => PacketType::Block,
-            3 => PacketType::Transaction,
-            _ => return None
-        })
-    }
+pub trait PacketType : Sized {
+    fn to_byte(&self) -> u8;
+    fn from_byte(byte: u8) -> Option<Self>;
 }
 
 pub trait Serializable {
@@ -34,10 +10,99 @@ pub trait Serializable {
     fn from_stream(stream: &mut BinaryStream) -> Self;
 }
 
-pub trait Packet {
-    fn get_type(&self) -> PacketType;
+pub trait PacketHeader<T: PacketType> {
+    fn get_type(&self) -> T;
 }
 
-pub trait ClientPacket : Serializable + Packet {
+pub trait Packet<T: PacketType> : Serializable + PacketHeader<T> {
 }
 
+#[derive(Debug, PartialEq)]
+pub enum BantamPacketType {
+    Handshake = 0,
+    HandshakeResponse = 1,
+    Data = 2,
+    Bye = 3
+}
+
+impl PacketType for BantamPacketType {
+    fn to_byte(&self) -> u8 {
+        match self {
+            BantamPacketType::Handshake => 0,
+            BantamPacketType::HandshakeResponse => 1,
+            BantamPacketType::Data => 2,
+            BantamPacketType::Bye => 3
+        }
+    }
+
+    fn from_byte(byte: u8) -> Option<BantamPacketType> {
+        Some(match byte {
+            0 => BantamPacketType::Handshake,
+            1 => BantamPacketType::HandshakeResponse,
+            2 => BantamPacketType::Data,
+            3 => BantamPacketType::Bye,
+            _ => return None
+        })
+    }
+}
+
+pub struct HandshakePacket {
+    listening_port: u16
+}
+
+pub struct HandshakeResponsePacket {
+    pub peers: Vec<SerializableSocketAddr>
+}
+
+struct ByePacket {
+}
+
+impl Serializable for HandshakePacket {
+    fn to_stream(&self, stream: &mut BinaryStream) {
+        stream.write_u16(self.listening_port).unwrap();
+    }
+
+    fn from_stream(stream: &mut BinaryStream) -> Self {
+        HandshakePacket::new(stream.read_u16().unwrap())
+    }
+}
+
+impl PacketHeader<BantamPacketType> for HandshakePacket {
+    fn get_type(&self) -> BantamPacketType {
+        BantamPacketType::Handshake
+    }
+}
+
+impl HandshakePacket {
+    pub fn new(listening_port: u16) -> HandshakePacket {
+        HandshakePacket {
+            listening_port
+        }
+    }
+}
+
+impl Serializable for HandshakeResponsePacket {
+    fn to_stream(&self, stream: &mut BinaryStream) {
+        stream.write_vec(&self.peers).unwrap();
+    }
+
+    fn from_stream(stream: &mut BinaryStream) -> Self {
+        HandshakeResponsePacket {
+            peers: stream.read_vec::<SerializableSocketAddr>().unwrap()
+        }
+    }
+}
+
+impl PacketHeader<BantamPacketType> for HandshakeResponsePacket {
+    fn get_type(&self) -> BantamPacketType {
+        BantamPacketType::HandshakeResponse
+    }
+}
+
+impl HandshakeResponsePacket {
+    pub fn new(peers: Vec<SerializableSocketAddr>) -> HandshakeResponsePacket {
+        HandshakeResponsePacket {
+            peers
+        }
+    }
+}

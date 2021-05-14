@@ -16,6 +16,7 @@ impl Default for SerializableSocketAddr {
         }
     }
 }
+
 fn byte_vec_to_short_vec(bytes: Vec<u8>) -> Vec<u16> {
     // As the segments of the IPv6 address are stored in u16, couple every pair of the 16 bytes,
     // so 8 in total together.

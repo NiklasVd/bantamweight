@@ -119,7 +119,7 @@ impl BinaryStream {
     // Reading
 
     pub fn read_bool(&mut self) -> io::Result<bool> {
-        self.read_buffer_single().map(|byte| byte == 0)
+        self.read_buffer_single().map(|byte| byte == 1)
     }
 
     pub fn read_u16(&mut self) -> io::Result<u16> {

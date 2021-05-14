@@ -47,6 +47,18 @@ mod tests {
     }
 
     #[test]
+    fn empty_vec_serialization_test() {
+        let alpha = Alpha(0, vec![]);
+        let mut stream = BinaryStream::new();
+        alpha.to_stream(&mut stream);
+
+        let mut deserialization_stream = BinaryStream::from_buffer(stream.get_buffer());
+        let alpha_deserialized = Alpha::from_stream(&mut deserialization_stream);
+        println!("A {:?} <=> A-Des. {:?}", alpha, alpha_deserialized);
+        assert_eq!(alpha, alpha_deserialized)
+    }
+
+    #[test]
     fn socket_addr_serialization_test() {
         let sock_addr = SerializableSocketAddr::from_sock_addr(SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::new(0, 25, 0, 0, 0, 668, 0, 1), 8081, 0, 0)));
         let sock_addr2 = SerializableSocketAddr::from_sock_addr(SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::new(12312, 0, 0, 1, 0, 0, 0, 2), 8080, 0, 0)));

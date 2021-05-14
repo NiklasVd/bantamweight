@@ -69,6 +69,10 @@ impl BinaryStream {
 
     // Writing
 
+    pub fn write_bool(&mut self, val: bool) -> io::Result<()> {
+        self.write_buffer_single(val as u8)
+    }
+
     pub fn write_u16(&mut self, val: u16) -> io::Result<()> {
         self.write_buffer(&val.to_le_bytes().to_vec())
     }
@@ -113,6 +117,10 @@ impl BinaryStream {
     }
 
     // Reading
+
+    pub fn read_bool(&mut self) -> io::Result<bool> {
+        self.read_buffer_single().map(|byte| byte == 0)
+    }
 
     pub fn read_u16(&mut self) -> io::Result<u16> {
         let bytes = collect_array(self.read_buffer(2)?);

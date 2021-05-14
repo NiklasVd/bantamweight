@@ -47,23 +47,32 @@ impl PacketType for BantamPacketType {
 }
 
 pub struct HandshakePacket {
-    listening_port: u16
+    pub listening_port: u16,
+    pub request_peers: bool
 }
 
 pub struct HandshakeResponsePacket {
     pub peers: Vec<SerializableSocketAddr>
 }
 
-struct ByePacket {
+pub struct DataPacket {
+    pub bytes: Vec<u8>
+}
+
+pub struct ByePacket {
+    pub flag: u8
 }
 
 impl Serializable for HandshakePacket {
     fn to_stream(&self, stream: &mut BinaryStream) {
         stream.write_u16(self.listening_port).unwrap();
+        stream.write_bool(self.request_peers).unwrap();
     }
 
     fn from_stream(stream: &mut BinaryStream) -> Self {
-        HandshakePacket::new(stream.read_u16().unwrap())
+        let listening_port = stream.read_u16().unwrap();
+        let request_peers = stream.read_bool().unwrap();
+        HandshakePacket::new(listening_port, request_peers)
     }
 }
 
@@ -74,9 +83,10 @@ impl PacketHeader<BantamPacketType> for HandshakePacket {
 }
 
 impl HandshakePacket {
-    pub fn new(listening_port: u16) -> HandshakePacket {
+    pub fn new(listening_port: u16, request_peers: bool) -> HandshakePacket {
         HandshakePacket {
-            listening_port
+            listening_port,
+            request_peers
         }
     }
 }
@@ -103,6 +113,54 @@ impl HandshakeResponsePacket {
     pub fn new(peers: Vec<SerializableSocketAddr>) -> HandshakeResponsePacket {
         HandshakeResponsePacket {
             peers
+        }
+    }
+}
+
+impl Serializable for DataPacket {
+    fn to_stream(&self, stream: &mut BinaryStream) {
+        stream.write_buffer(&self.bytes).unwrap();
+    }
+
+    fn from_stream(stream: &mut BinaryStream) -> Self {
+        DataPacket::new(stream.read_buffer(stream.size()).unwrap())
+    }
+}
+
+impl PacketHeader<BantamPacketType> for DataPacket {
+    fn get_type(&self) -> BantamPacketType {
+        BantamPacketType::Data
+    }
+}
+
+impl DataPacket {
+    pub fn new(bytes: Vec<u8>) -> DataPacket {
+        DataPacket {
+            bytes
+        }
+    }
+}
+
+impl Serializable for ByePacket {
+    fn to_stream(&self, stream: &mut BinaryStream) {
+        stream.write_buffer_single(self.flag).unwrap();
+    }
+
+    fn from_stream(stream: &mut BinaryStream) -> Self {
+        ByePacket::new(stream.read_buffer_single().unwrap())
+    }
+}
+
+impl PacketHeader<BantamPacketType> for ByePacket {
+    fn get_type(&self) -> BantamPacketType {
+        BantamPacketType::Bye
+    }
+}
+
+impl ByePacket {
+    pub fn new(flag: u8) -> ByePacket {
+        ByePacket {
+            flag
         }
     }
 }

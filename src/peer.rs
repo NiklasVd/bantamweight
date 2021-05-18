@@ -1,4 +1,4 @@
-use std::{collections::HashMap, error::Error, net::SocketAddr, sync::Arc};
+use std::{collections::HashMap, error::Error, io::ErrorKind, net::SocketAddr, sync::Arc};
 use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::{TcpListener, TcpStream, tcp::ReadHalf}, sync::{mpsc, Mutex}};
 use crate::{AM, BantamPacketType, BinaryStream, ByePacket, DataPacket, HandshakePacket, HandshakeResponsePacket, PacketHeader, Serializable, SerializableSocketAddr};
 
@@ -153,6 +153,10 @@ async fn handle_peer_io_loop<T: ExternalSharedState + Send + Sync + 'static>(mut
                             eprintln!("Error occured while reading packet segments of {}: {}", addr, e);
                             break;
                         },
+                        Ok(total_bytes_received) if total_bytes_received == 0 => {
+                            eprintln!("Received corrupt packet of size {}.", bytes_received);
+                            break
+                        },
                         _ => ()
                     }
 
@@ -166,15 +170,16 @@ async fn handle_peer_io_loop<T: ExternalSharedState + Send + Sync + 'static>(mut
                         _ => ()
                     }
                 },
+                Err(e) if e.kind() == ErrorKind::ConnectionReset => break, // Peer disconnected
                 Err(e) => {
-                    eprintln!("Error occured while reading stream of {}: {}", &addr, e); // Add e.kind()
+                    eprintln!("Error ({:?}) occured while reading stream of {}: {}", e.kind(), &addr, e);
                     break
                 }
             }
         }
     }
 
-    println!("Terminating IO loop for peer {}.", &addr);
+    println!("Peer {} disconnected.", &addr);
     writer.shutdown().await?;
     shared_state.lock().await.remove_peer(addr);
 
@@ -182,39 +187,40 @@ async fn handle_peer_io_loop<T: ExternalSharedState + Send + Sync + 'static>(mut
 }
 
 async fn read_segments<'a>(bytes_received: usize, buffer_vec: &mut Vec<u8>, reader: &mut ReadHalf<'a>)
-    -> Result<(), Box<dyn Error + Send + Sync>> {
-    if bytes_received <= 4 {
-        println!("Received a packet that only contains the packet size.");
-        return Ok(());
+    -> Result<usize, Box<dyn Error + Send + Sync>> {
+    if bytes_received <= 4 { // As the base bantam packet header (size of packet) is 4 bytes big, a valid message must have > 4 bytes.
+        return Ok(0);
     }
 
     let total_packet_size = check_first_packet_segment(buffer_vec);
-    let packet_bytes_received = bytes_received - 4;
-    // println!("Total packet size: {}b, read segment: {}b.", total_packet_size, packet_bytes_received);
+    if total_packet_size > TCP_STREAM_READ_BUFFER_SIZE * 4 {
+        println!("Downloading segmented packet...");
+    }
 
-    // TODO: Remove if statement?
-    if packet_bytes_received < total_packet_size {
-        // There's more...
-        let mut total_packet_bytes_received = packet_bytes_received;
-        // As long as the amount of bytes we read is still less than the size announced by the packet, continue reading...
-        while total_packet_bytes_received < total_packet_size {
-            let mut buffer = [0u8; TCP_STREAM_READ_BUFFER_SIZE];
-            match reader.read(&mut buffer).await {
-                Ok(bytes_received) => {
-                    buffer_vec.extend(buffer[0..bytes_received].to_vec());
-                    total_packet_bytes_received += bytes_received;
-                
-                    if total_packet_bytes_received % TCP_STREAM_READ_BUFFER_SIZE == 0 {
-                        println!("Read segment with {}b ({}b of {}b).", bytes_received,
+    let mut total_packet_bytes_received = bytes_received - 4;
+    // As long as the amount of bytes we read is still less than the size announced by the packet, continue reading...
+    while total_packet_bytes_received < total_packet_size {
+        let mut buffer = [0u8; TCP_STREAM_READ_BUFFER_SIZE];
+        match reader.read(&mut buffer).await {
+            Ok(bytes_received) => {
+                buffer_vec.extend(buffer[0..bytes_received].to_vec());
+                total_packet_bytes_received += bytes_received;
+            
+                if total_packet_size > TCP_STREAM_READ_BUFFER_SIZE * 4 /* 2048 */ {
+                    // If the total packet size is greater than 2048 bytes, show the reading progress 6 times.
+                    if total_packet_bytes_received % (total_packet_size / 5 / TCP_STREAM_READ_BUFFER_SIZE) == 0 {
+                        let progress_percentage = f32::round(total_packet_bytes_received as f32 /
+                            total_packet_size as f32 * 100f32);
+                        println!("Read {}% of packet ({}b of {}b).", progress_percentage,
                             total_packet_bytes_received, total_packet_size);
                     }
-                },
-                Err(e) => return Err(Box::new(e))
-            }
+                }
+            },
+            Err(e) => return Err(Box::new(e))
         }
     }
 
-    Ok(())
+    Ok(total_packet_size)
 }
 
 fn check_first_packet_segment(buffer: &mut Vec<u8>) -> usize {

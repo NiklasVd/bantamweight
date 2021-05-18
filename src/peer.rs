@@ -1,13 +1,23 @@
-use std::{collections::HashMap, error::Error, io::ErrorKind, net::SocketAddr, sync::Arc};
-use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::{TcpListener, TcpStream}, sync::{mpsc, Mutex}};
+use std::{collections::HashMap, error::Error, net::SocketAddr, sync::Arc};
+use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::{TcpListener, TcpStream, tcp::ReadHalf}, sync::{mpsc, Mutex}};
 use crate::{AM, BantamPacketType, BinaryStream, ByePacket, DataPacket, HandshakePacket, HandshakeResponsePacket, PacketHeader, Serializable, SerializableSocketAddr};
 
+// Important detail
+// Average BrunoCoin BlockPacket is 164b (only coinbase).
+// BlockchainPacket with even just 10 packets is already > 1600b.
+// Other packets are merely ~5-30b, and are only sent irregularly.
+pub const TCP_STREAM_READ_BUFFER_SIZE: usize = 256;
 type Tx = mpsc::UnboundedSender<Vec<u8>>;
 
 pub struct Peer {
     // Add ingoing/outgoing peer tag?
     pub listener_addr: SocketAddr,
     sender: Tx
+}
+
+pub trait ExternalSharedState {
+    fn on_connected(&mut self);
+    fn on_receive_packet(&mut self, bytes: Vec<u8>, sender_addr: SocketAddr);
 }
 
 pub struct PeerSharedState {
@@ -43,16 +53,20 @@ impl PeerSharedState {
         if let Some(peer) = self.peers.get(&addr) {
             peer.sender.send(bytes)?;
         }
+        else {
+            eprintln!("Peer with address {} is not part of this network.", addr);
+        }
+        
         Ok(())
     }
 }
 
 // --- Called by a peer that wants to connect ot a P2P network. ---
-pub async fn setup_peer<F: Fn(Vec<u8>, SocketAddr) + Send + Sync + 'static>(port: u16, addr: SocketAddr,
-    on_receive_data_packet: Arc<F>) -> Result<AM<PeerSharedState>, Box<dyn Error + Send + Sync>> {
-    let shared_state = setup_ingoing_peer(port, on_receive_data_packet.clone()).await?;
+pub async fn setup_peer<T: ExternalSharedState + Send + Sync + 'static>(port: u16, addr: SocketAddr,
+    ext_shared_state: AM<T>) -> Result<AM<PeerSharedState>, Box<dyn Error + Send + Sync>> {
+    let shared_state = setup_ingoing_peer(port, ext_shared_state.clone()).await?;
     let shared_state_ref = shared_state.clone();
-    setup_outgoing_peer(addr, shared_state, true, on_receive_data_packet.clone()).await?;
+    setup_outgoing_peer(addr, shared_state, true, ext_shared_state.clone()).await?;
 
     Ok(shared_state_ref)
 }
@@ -63,8 +77,8 @@ pub async fn setup_peer<F: Fn(Vec<u8>, SocketAddr) + Send + Sync + 'static>(port
 // in order to join.
 // Everybody joining after us will be accepted via the listener, while everyone joining before we
 // enter the network will be connected to manually.
-pub async fn setup_ingoing_peer<F: Fn(Vec<u8>, SocketAddr) + Send + Sync + 'static>(port: u16,
-    on_receive_data_packet: Arc<F>) -> Result<AM<PeerSharedState>, Box<dyn Error + Send + Sync>> {
+pub async fn setup_ingoing_peer<T: ExternalSharedState + Send + Sync + 'static>(port: u16,
+    ext_shared_state: AM<T>) -> Result<AM<PeerSharedState>, Box<dyn Error + Send + Sync>> {
     let listener_addr: SocketAddr = format!("0.0.0.0:{}", port).parse().unwrap();
     let listener = TcpListener::bind(listener_addr).await?;
     let shared_state = Arc::new(Mutex::new(PeerSharedState {
@@ -79,8 +93,7 @@ pub async fn setup_ingoing_peer<F: Fn(Vec<u8>, SocketAddr) + Send + Sync + 'stat
             match listener.accept().await {
                 Ok((conn, addr)) => {
                     let shared_state_conn = shared_state.clone();
-                    println!("Ingoing peer {} connected.", &addr);
-                    handle_peer(conn, addr, shared_state_conn, on_receive_data_packet.clone())
+                    handle_peer(conn, addr, shared_state_conn, ext_shared_state.clone())
                 },
                 Err(e) => {
                     eprintln!("Failed to accept new connection: {}.", e);
@@ -95,14 +108,14 @@ pub async fn setup_ingoing_peer<F: Fn(Vec<u8>, SocketAddr) + Send + Sync + 'stat
 }
 
 // Called after setup_ingoing_peer(), in order to enter a P2P network
-async fn setup_outgoing_peer<F: Fn(Vec<u8>, SocketAddr) + Send + Sync + 'static>(addr: SocketAddr, shared_state: AM<PeerSharedState>, request_peers: bool,
-    on_receive_data_packet: Arc<F>) -> Result<(), Box<dyn Error + Send + Sync>> {
+async fn setup_outgoing_peer<T: ExternalSharedState + Send + Sync + 'static>(addr: SocketAddr,
+    shared_state: AM<PeerSharedState>, request_peers: bool, ext_shared_state: AM<T>) -> Result<(), Box<dyn Error + Send + Sync>> {
     let mut conn = TcpStream::connect(addr).await?;
 
     // Send the handshake to pass port for ingoing connections and to fetch list of all peers
     conn.write_all(&construct_bantam_packet(HandshakePacket::new(
         shared_state.lock().await.listener_addr.port(), request_peers))).await?;
-    handle_peer(conn, addr, shared_state.clone(), on_receive_data_packet);
+    handle_peer(conn, addr, shared_state.clone(), ext_shared_state);
 
     Ok(())
 }
@@ -111,110 +124,52 @@ pub async fn shutdown(shared_state: AM<PeerSharedState>) -> Result<(), Box<dyn E
     send_bantam_packet(ByePacket::new(0), shared_state).await
 }
 
-fn handle_peer<F: Fn(Vec<u8>, SocketAddr) + Send + Sync + 'static>(conn: TcpStream, addr: SocketAddr, shared_state: AM<PeerSharedState>,
-    on_receive_data_packet: Arc<F>) {
+fn handle_peer<T: ExternalSharedState + Send + Sync + 'static>(conn: TcpStream, addr: SocketAddr,
+    shared_state: AM<PeerSharedState>, ext_shared_state: AM<T>) {
     tokio::spawn(async move {
-        if let Err(e) = handle_peer_io_loop(conn, addr, shared_state, on_receive_data_packet).await {
+        if let Err(e) = handle_peer_io_loop(conn, addr, shared_state, ext_shared_state).await {
             eprintln!("Failed running IO loop for {}: {}", addr, e);
         }
     });
 }
 
-async fn handle_peer_io_loop<F: Fn(Vec<u8>, SocketAddr) + Send + Sync + 'static>(mut conn: TcpStream, addr: SocketAddr,
-    shared_state: AM<PeerSharedState>, on_receive_data_packet: Arc<F>) -> Result<(), Box<dyn Error + Send + Sync>> {
+async fn handle_peer_io_loop<T: ExternalSharedState + Send + Sync + 'static>(mut conn: TcpStream, addr: SocketAddr,
+    shared_state: AM<PeerSharedState>, ext_shared_state: AM<T>) -> Result<(), Box<dyn Error + Send + Sync>> {
     let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
     let (mut reader, mut writer) = conn.split();
     
     loop {
-        let mut buffer = [0u8; 2048];
+        let mut buffer = [0u8; TCP_STREAM_READ_BUFFER_SIZE];
         tokio::select! {
             Some(msg) = rx.recv() => {
                 writer.write_all(&msg).await?;
             }
             read_result = reader.read(&mut buffer) => match read_result {
-                Ok(bytes_read) if bytes_read > 0 => {
-                    let packet_buffer = buffer[0..bytes_read].to_vec();
-                    let (packet_type, mut stream) = deconstruct_bantam_packet(packet_buffer);
-                    
-                    match packet_type {
-                        BantamPacketType::Handshake => {
-                            // This will only occur on the ingoing (=listening) peer side
-                            let handshake = HandshakePacket::from_stream(&mut stream);
-
-                            // After hands have been shook, add the peer to the network
-                            // We construct the listener address of the peer from the port they send us.
-                            // This way, we can send new connections this peer's actual ingoing listener address.
-                            let mut listener_addr = addr.clone();
-                            listener_addr.set_port(handshake.listening_port);
-                            shared_state.lock().await.add_peer(addr, Peer {
-                                listener_addr, sender: tx.clone()
-                            });
-
-                            // If the ingoing peer requested a list of all P2P network members, fetch the list.
-                            // If the peer didn't request such list, they already have a connection to an entry
-                            // peer and used their peer address list to connect to us.
-                            let peer_addresses = match handshake.request_peers {
-                                true => {
-                                    let mut peer_addresses = vec![];
-                                    let shared_state_lock = shared_state.lock().await;
-                                    for (_, peer) in shared_state_lock.peers.iter() {
-                                        // If it's not the peer we're currently sending the peer list to...
-                                        if peer.listener_addr != listener_addr {
-                                            // ... then include the peer in the list.
-                                            peer_addresses.push(SerializableSocketAddr::from_sock_addr(peer.listener_addr));
-                                        }
-                                    }
-
-                                    println!("Peer {} connected. Sending address list...", &addr);
-                                    peer_addresses
-                                },
-                                false => {
-                                    println!("Peer {} connected.", &addr);
-                                    vec![]
-                                }
-                            };
-
-                            send_bantam_packet_to(HandshakeResponsePacket::new(peer_addresses),
-                                addr, shared_state.clone()).await?;
+                Ok(bytes_received) => {
+                    let mut buffer_vec = buffer[0..bytes_received].to_vec();
+                    // Check the segment read first and potentially read remaining segments of the whole packet.
+                    match read_segments(bytes_received, &mut buffer_vec, &mut reader).await {
+                        Err(e) => {
+                            eprintln!("Error occured while reading packet segments of {}: {}", addr, e);
+                            break;
                         },
-                        BantamPacketType::HandshakeResponse => {
-                            // This will only occur on the outgoing (=connecting) peer side
+                        _ => ()
+                    }
 
-                            // As we now successfully connected, we can safely add the outgoing peer
-                            shared_state.lock().await.add_peer(addr, Peer {
-                                listener_addr: addr, sender: tx.clone()
-                            });
-
-                            let handshake_response = HandshakeResponsePacket::from_stream(&mut stream);
-                            println!("Approved connection to outgoing peer successfully.");
-                            // Connect to all peers that are in the P2P network, according to first-hand connection
-                            if handshake_response.peers.len() > 0 {
-                                println!("Connecting to remaining {} peers on the network...", handshake_response.peers.len());
-                                for addr in handshake_response.peers {
-                                    let sock_addr = addr.to_sock_addr();
-                                    if !shared_state.lock().await.peers.contains_key(&sock_addr) {
-                                        setup_outgoing_peer(sock_addr, shared_state.clone(), false, on_receive_data_packet.clone()).await?;
-                                    }
-                                }
-                            }
-                        },
-                        BantamPacketType::Data => {
-                            let data_packet = DataPacket::from_stream(&mut stream);
-                            on_receive_data_packet(data_packet.bytes, addr);
-                        },
-                        BantamPacketType::Bye => {
-                            println!("Peer {} manually disconnected.", &addr);
+                    // Process packet depending on BantamPacketType
+                    match process_packet(buffer_vec, addr, tx.clone(), shared_state.clone(), ext_shared_state.clone()).await {
+                        Ok(connected) if !connected => break, // If the function returns Ok(false), peer sent a ByePacket
+                        Err(e) => {
+                            eprintln!("Error occured while processing received packet: {}.", e);
                             break
                         },
+                        _ => ()
                     }
-                }
-                Err(e) if e.kind() == ErrorKind::WouldBlock => (), // Nothing to read
-                Err(e) => {
-                    // What to do?
-                    eprintln!("Error occured while reading from {} stream: {}", &addr, e);
-                    break
                 },
-                _ => ()
+                Err(e) => {
+                    eprintln!("Error occured while reading stream of {}: {}", &addr, e); // Add e.kind()
+                    break
+                }
             }
         }
     }
@@ -223,6 +178,146 @@ async fn handle_peer_io_loop<F: Fn(Vec<u8>, SocketAddr) + Send + Sync + 'static>
     writer.shutdown().await?;
     shared_state.lock().await.remove_peer(addr);
 
+    Ok(())
+}
+
+async fn read_segments<'a>(bytes_received: usize, buffer_vec: &mut Vec<u8>, reader: &mut ReadHalf<'a>)
+    -> Result<(), Box<dyn Error + Send + Sync>> {
+    if bytes_received <= 4 {
+        println!("Received a packet that only contains the packet size.");
+        return Ok(());
+    }
+
+    let total_packet_size = check_first_packet_segment(buffer_vec);
+    let packet_bytes_received = bytes_received - 4;
+    // println!("Total packet size: {}b, read segment: {}b.", total_packet_size, packet_bytes_received);
+
+    // TODO: Remove if statement?
+    if packet_bytes_received < total_packet_size {
+        // There's more...
+        let mut total_packet_bytes_received = packet_bytes_received;
+        // As long as the amount of bytes we read is still less than the size announced by the packet, continue reading...
+        while total_packet_bytes_received < total_packet_size {
+            let mut buffer = [0u8; TCP_STREAM_READ_BUFFER_SIZE];
+            match reader.read(&mut buffer).await {
+                Ok(bytes_received) => {
+                    buffer_vec.extend(buffer[0..bytes_received].to_vec());
+                    total_packet_bytes_received += bytes_received;
+                
+                    if total_packet_bytes_received % TCP_STREAM_READ_BUFFER_SIZE == 0 {
+                        println!("Read segment with {}b ({}b of {}b).", bytes_received,
+                            total_packet_bytes_received, total_packet_size);
+                    }
+                },
+                Err(e) => return Err(Box::new(e))
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn check_first_packet_segment(buffer: &mut Vec<u8>) -> usize {
+    let mut size_bytes = [0u8; 4];
+    // Remove the first four elements of the buffer, i.e., the u32 at the beginning of the first packet segment,
+    // which indicates the total packet size.
+    for i in 0..4 {
+        size_bytes[i] = buffer.remove(0);
+    }
+
+    u32::from_le_bytes(size_bytes) as usize
+}
+
+async fn process_packet<T: ExternalSharedState + Send + Sync + 'static>(bytes: Vec<u8>, addr: SocketAddr,
+    tx: Tx, shared_state: AM<PeerSharedState>, ext_shared_state: AM<T>) -> Result<bool, Box<dyn Error + Send + Sync>> {
+    let (packet_type, mut stream) = deconstruct_bantam_packet(bytes);
+    match packet_type {
+        BantamPacketType::Handshake => {
+            process_handshake_packet(stream, addr, tx.clone(), shared_state.clone()).await?;
+        },
+        BantamPacketType::HandshakeResponse => {
+            process_handshake_response_packet(stream, addr, tx.clone(), shared_state.clone(),
+                ext_shared_state.clone()).await?;
+        },
+        BantamPacketType::Data => {
+            let data_packet = DataPacket::from_stream(&mut stream);
+            ext_shared_state.lock().await.on_receive_packet(data_packet.bytes, addr);
+        },
+        BantamPacketType::Bye => {
+            println!("Peer {} manually disconnected.", &addr);
+            return Ok(false);
+        },
+    }
+
+    Ok(true)
+}
+
+async fn process_handshake_packet(mut stream: BinaryStream, addr: SocketAddr, tx: Tx,
+    shared_state: AM<PeerSharedState>) -> Result<(), Box<dyn Error + Send + Sync>> {
+    // This will only occur on the ingoing (=listening) peer side
+    let handshake = HandshakePacket::from_stream(&mut stream);
+
+    // After hands have been shook, add the peer to the network
+    // We construct the listener address of the peer from the port they send us.
+    // This way, we can send new connections this peer's actual ingoing listener address.
+    let mut listener_addr = addr.clone();
+    listener_addr.set_port(handshake.listening_port);
+    shared_state.lock().await.add_peer(addr, Peer {
+        listener_addr, sender: tx.clone()
+    });
+
+    // If the ingoing peer requested a list of all P2P network members, fetch the list.
+    // If the peer didn't request such list, they already have a connection to an entry
+    // peer and used their peer address list to connect to us.
+    let peer_addresses = match handshake.request_peers {
+        true => {
+            let mut peer_addresses = vec![];
+            let shared_state_lock = shared_state.lock().await;
+            for (_, peer) in shared_state_lock.peers.iter() {
+                // If it's not the peer we're currently sending the peer list to...
+                if peer.listener_addr != listener_addr {
+                    // ... then include the peer in the list.
+                    peer_addresses.push(SerializableSocketAddr::from_sock_addr(peer.listener_addr));
+                }
+            }
+
+            println!("Peer {} connected. Integrating into network...", &addr);
+            peer_addresses
+        },
+        false => {
+            println!("Peer {} connected.", &addr);
+            vec![]
+        }
+    };
+
+    send_bantam_packet_to(HandshakeResponsePacket::new(peer_addresses),
+        addr, shared_state.clone()).await
+}
+
+async fn process_handshake_response_packet<T: ExternalSharedState + Send + Sync + 'static>(
+    mut stream: BinaryStream, addr: SocketAddr, tx: Tx, shared_state: AM<PeerSharedState>,
+    ext_shared_state: AM<T>) -> Result<(), Box<dyn Error + Send + Sync>> {
+    // This will only occur on the outgoing (=connecting) peer side
+
+    // As we now successfully connected, we can safely add the outgoing peer
+    shared_state.lock().await.add_peer(addr, Peer {
+        listener_addr: addr, sender: tx.clone()
+    });
+
+    let handshake_response = HandshakeResponsePacket::from_stream(&mut stream);
+    // Connect to all peers that are in the P2P network, according to first-hand connection
+    if handshake_response.peers.len() > 0 {
+        for addr in handshake_response.peers {
+            let sock_addr = addr.to_sock_addr();
+            if !shared_state.lock().await.peers.contains_key(&sock_addr) {
+                setup_outgoing_peer(sock_addr, shared_state.clone(), false, ext_shared_state.clone()).await?;
+            }
+        }
+        
+        println!("Established connection to network.");
+    }
+
+    ext_shared_state.lock().await.on_connected();
     Ok(())
 }
 
@@ -242,7 +337,12 @@ fn construct_bantam_packet<T: PacketHeader<BantamPacketType> + Serializable>(
     stream.write_packet_type(packet.get_type()).unwrap();
     packet.to_stream(&mut stream);
     
-    stream.get_buffer_vec()
+    let buffer = stream.get_buffer_vec();
+    // Write the total packet size for the receiver, so they know how much to read.
+    let mut header = u32::to_le_bytes(buffer.len() as u32).to_vec();
+    // We need the packet size indicator to be at the very beginning of the packet, so it can be read first.
+    header.extend(buffer);
+    header
 }
 
 fn deconstruct_bantam_packet(bytes: Vec<u8>) -> (BantamPacketType, BinaryStream) {

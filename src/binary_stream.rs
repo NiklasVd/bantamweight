@@ -13,10 +13,10 @@ pub struct BinaryStream {
     buffer: VecDeque<u8>
 }
 
-fn collect_array<T, I, const N: usize>(itr: I) -> [T; N]
-where
-    T: Default + Copy,
-    I: IntoIterator<Item = T>,
+pub fn collect_array<T, I, const N: usize>(itr: I) -> [T; N]
+    where
+        T: Default + Copy,
+        I: IntoIterator<Item = T>,
 {
     let mut res = [T::default(); N];
     for (it, elem) in res.iter_mut().zip(itr) {
@@ -65,6 +65,10 @@ impl BinaryStream {
 
     pub fn get_buffer_vec(mut self) -> Vec<u8> {
         self.buffer.make_contiguous().to_vec()
+    }
+
+    pub fn get_buffer_clone(&self) -> VecDeque<u8> {
+        self.buffer.clone()
     }
 
     // Writing

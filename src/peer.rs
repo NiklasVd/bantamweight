@@ -1,5 +1,5 @@
-use std::{collections::HashMap, error::Error, io::ErrorKind, net::SocketAddr, sync::Arc};
-use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::{TcpListener, TcpStream, tcp::ReadHalf}, sync::{mpsc, Mutex}};
+use std::{collections::HashMap, error::Error, fmt, io::ErrorKind, net::SocketAddr, sync::Arc, time::Duration};
+use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::{TcpListener, TcpStream, tcp::ReadHalf}, sync::{mpsc, Mutex}, time::timeout};
 use crate::{AM, BantamPacketType, BinaryStream, ByePacket, DataPacket, HandshakePacket, HandshakeResponsePacket, PacketHeader, Serializable, SerializableSocketAddr};
 
 // Important detail
@@ -7,7 +7,36 @@ use crate::{AM, BantamPacketType, BinaryStream, ByePacket, DataPacket, Handshake
 // BlockchainPacket with even just 10 packets is already > 1600b.
 // Other packets are merely ~5-30b, and are only sent irregularly.
 pub const TCP_STREAM_READ_BUFFER_SIZE: usize = 256;
+pub const TCP_STREAM_CONNECTION_TIMEOUT_SECS: u64 = 15;
+pub const TCP_STREAM_READ_TIMEOUT_SECS: u64 = 5;
 type Tx = mpsc::UnboundedSender<Vec<u8>>;
+
+#[derive(Debug)]
+pub enum BantamError {
+    ConnectionTimeout,
+    ReadTimeout,
+    ReceivedCorruptedPacket
+}
+
+impl fmt::Display for BantamError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{}", self.to_string())
+    }
+}
+
+impl Error for BantamError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        None
+    }
+
+    fn description(&self) -> &str {
+        "description() is deprecated; use Display"
+    }
+
+    fn cause(&self) -> Option<&dyn Error> {
+        None
+    }
+}
 
 pub struct Peer {
     // Add ingoing/outgoing peer tag?
@@ -16,7 +45,8 @@ pub struct Peer {
 }
 
 pub trait ExternalSharedState {
-    fn on_connected(&mut self);
+    fn on_connected(&mut self, addr: SocketAddr);
+    fn on_disconnected(&mut self, addr: SocketAddr); // E.g., so that miner can remove blockchain requests from the list
     fn on_receive_packet(&mut self, bytes: Vec<u8>, sender_addr: SocketAddr);
 }
 
@@ -32,6 +62,10 @@ impl PeerSharedState {
         }).collect();
 
         peers
+    }
+
+    pub fn get_peer_count(&self) -> usize {
+        return self.peers.len()
     }
 
     fn add_peer(&mut self, addr: SocketAddr, peer: Peer) -> bool {
@@ -93,6 +127,8 @@ pub async fn setup_ingoing_peer<T: ExternalSharedState + Send + Sync + 'static>(
             match listener.accept().await {
                 Ok((conn, addr)) => {
                     let shared_state_conn = shared_state.clone();
+                    println!("Accepted connection with {}...", &addr);
+
                     handle_peer(conn, addr, shared_state_conn, ext_shared_state.clone())
                 },
                 Err(e) => {
@@ -110,14 +146,27 @@ pub async fn setup_ingoing_peer<T: ExternalSharedState + Send + Sync + 'static>(
 // Called after setup_ingoing_peer(), in order to enter a P2P network
 async fn setup_outgoing_peer<T: ExternalSharedState + Send + Sync + 'static>(addr: SocketAddr,
     shared_state: AM<PeerSharedState>, request_peers: bool, ext_shared_state: AM<T>) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let mut conn = TcpStream::connect(addr).await?;
+    // Connect to TCP stream until timeout interrupts the operation.
+    match timeout(Duration::from_secs(TCP_STREAM_CONNECTION_TIMEOUT_SECS),
+        TcpStream::connect(addr)).await {
+        Ok(connection_result) => {
+            match connection_result {
+                Ok(mut conn) => {
+                    // Send the handshake to pass port for ingoing connections and to fetch list of all peers
+                    conn.write_all(&construct_bantam_packet(HandshakePacket::new(
+                    shared_state.lock().await.listener_addr.port(), request_peers))).await?;
+                    println!("Connecting with {}...", &addr);
+                    handle_peer(conn, addr, shared_state.clone(), ext_shared_state);
 
-    // Send the handshake to pass port for ingoing connections and to fetch list of all peers
-    conn.write_all(&construct_bantam_packet(HandshakePacket::new(
-        shared_state.lock().await.listener_addr.port(), request_peers))).await?;
-    handle_peer(conn, addr, shared_state.clone(), ext_shared_state);
-
-    Ok(())
+                    Ok(())
+                },
+                Err(e) => return Err(Box::new(e))
+            }
+        },
+        Err(_) => {
+            return Err(Box::new(BantamError::ConnectionTimeout));
+        }
+    }
 }
 
 pub async fn shutdown(shared_state: AM<PeerSharedState>) -> Result<(), Box<dyn Error + Send + Sync>> {
@@ -126,6 +175,14 @@ pub async fn shutdown(shared_state: AM<PeerSharedState>) -> Result<(), Box<dyn E
 
 fn handle_peer<T: ExternalSharedState + Send + Sync + 'static>(conn: TcpStream, addr: SocketAddr,
     shared_state: AM<PeerSharedState>, ext_shared_state: AM<T>) {
+    // Configure the connection
+    if let Err(e) = conn.set_linger(None) {
+        println!("Failed to set linger duration of connection with {}: {}.", addr, e);
+    }
+    if let Err(e) = conn.set_nodelay(true) {
+        println!("Failed to set no delay of connection with {}: {}.", addr, e);
+    }
+
     tokio::spawn(async move {
         if let Err(e) = handle_peer_io_loop(conn, addr, shared_state, ext_shared_state).await {
             eprintln!("Failed running IO loop for {}: {}", addr, e);
@@ -137,7 +194,7 @@ async fn handle_peer_io_loop<T: ExternalSharedState + Send + Sync + 'static>(mut
     shared_state: AM<PeerSharedState>, ext_shared_state: AM<T>) -> Result<(), Box<dyn Error + Send + Sync>> {
     let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
     let (mut reader, mut writer) = conn.split();
-    
+
     loop {
         let mut buffer = [0u8; TCP_STREAM_READ_BUFFER_SIZE];
         tokio::select! {
@@ -153,10 +210,7 @@ async fn handle_peer_io_loop<T: ExternalSharedState + Send + Sync + 'static>(mut
                             eprintln!("Error occured while reading packet segments of {}: {}", addr, e);
                             break;
                         },
-                        Ok(total_bytes_received) if total_bytes_received == 0 => {
-                            eprintln!("Received corrupt packet of size {}.", bytes_received);
-                            break
-                        },
+                        Ok(total_bytes_received) if total_bytes_received == 0 => break,
                         _ => ()
                     }
 
@@ -180,7 +234,7 @@ async fn handle_peer_io_loop<T: ExternalSharedState + Send + Sync + 'static>(mut
     }
 
     println!("Peer {} disconnected.", &addr);
-    writer.shutdown().await?;
+    ext_shared_state.lock().await.on_disconnected(addr);
     shared_state.lock().await.remove_peer(addr);
 
     Ok(())
@@ -193,30 +247,32 @@ async fn read_segments<'a>(bytes_received: usize, buffer_vec: &mut Vec<u8>, read
     }
 
     let total_packet_size = check_first_packet_segment(buffer_vec);
-    if total_packet_size > TCP_STREAM_READ_BUFFER_SIZE * 4 {
-        println!("Downloading segmented packet...");
-    }
-
     let mut total_packet_bytes_received = bytes_received - 4;
+    let packet_bytes_received_percent_step = (total_packet_size as f32 * 0.25f32) as usize;
+    let mut packet_bytes_received_step = packet_bytes_received_percent_step;
+
     // As long as the amount of bytes we read is still less than the size announced by the packet, continue reading...
     while total_packet_bytes_received < total_packet_size {
         let mut buffer = [0u8; TCP_STREAM_READ_BUFFER_SIZE];
-        match reader.read(&mut buffer).await {
-            Ok(bytes_received) => {
-                buffer_vec.extend(buffer[0..bytes_received].to_vec());
-                total_packet_bytes_received += bytes_received;
-            
-                if total_packet_size > TCP_STREAM_READ_BUFFER_SIZE * 4 /* 2048 */ {
-                    // If the total packet size is greater than 2048 bytes, show the reading progress 6 times.
-                    if total_packet_bytes_received % (total_packet_size / 5 / TCP_STREAM_READ_BUFFER_SIZE) == 0 {
+        match timeout(Duration::from_secs(TCP_STREAM_READ_TIMEOUT_SECS), reader.read(&mut buffer)).await {
+            Ok(read_result) => {
+                match read_result {
+                    Ok(bytes_received) => {
+                        buffer_vec.extend(buffer[0..bytes_received].to_vec());
+                        total_packet_bytes_received += bytes_received;
+                        
                         let progress_percentage = f32::round(total_packet_bytes_received as f32 /
                             total_packet_size as f32 * 100f32);
-                        println!("Read {}% of packet ({}b of {}b).", progress_percentage,
-                            total_packet_bytes_received, total_packet_size);
-                    }
-                }
+                        if total_packet_bytes_received > packet_bytes_received_step {
+                            println!("Downloaded {}% of packet ({}b of {}b).", progress_percentage,
+                                total_packet_bytes_received, total_packet_size);
+                            packet_bytes_received_step += packet_bytes_received_percent_step;
+                        }
+                    },
+                    Err(e) => return Err(Box::new(e))
+                }   
             },
-            Err(e) => return Err(Box::new(e))
+            Err(_) => return Err(Box::new(BantamError::ReadTimeout))
         }
     }
 
@@ -278,8 +334,7 @@ async fn process_handshake_packet(mut stream: BinaryStream, addr: SocketAddr, tx
     let peer_addresses = match handshake.request_peers {
         true => {
             let mut peer_addresses = vec![];
-            let shared_state_lock = shared_state.lock().await;
-            for (_, peer) in shared_state_lock.peers.iter() {
+            for (_, peer) in shared_state.lock().await.peers.iter() {
                 // If it's not the peer we're currently sending the peer list to...
                 if peer.listener_addr != listener_addr {
                     // ... then include the peer in the list.
@@ -296,6 +351,7 @@ async fn process_handshake_packet(mut stream: BinaryStream, addr: SocketAddr, tx
         }
     };
 
+    // Ingoing peer is obligated to send handshake response.
     send_bantam_packet_to(HandshakeResponsePacket::new(peer_addresses),
         addr, shared_state.clone()).await
 }
@@ -310,20 +366,24 @@ async fn process_handshake_response_packet<T: ExternalSharedState + Send + Sync 
         listener_addr: addr, sender: tx.clone()
     });
 
+    // Outgoing peer is obligated to send handshake
     let handshake_response = HandshakeResponsePacket::from_stream(&mut stream);
     // Connect to all peers that are in the P2P network, according to first-hand connection
     if handshake_response.peers.len() > 0 {
+        println!("Connecting with remaining peers in the network...");
         for addr in handshake_response.peers {
             let sock_addr = addr.to_sock_addr();
             if !shared_state.lock().await.peers.contains_key(&sock_addr) {
-                setup_outgoing_peer(sock_addr, shared_state.clone(), false, ext_shared_state.clone()).await?;
+                if let Err(e) = setup_outgoing_peer(sock_addr, shared_state.clone(), false, ext_shared_state.clone()).await {
+                    println!("Connection attempt with {} failed: {}.", sock_addr, e);
+                    continue;
+                }
             }
         }
-        
-        println!("Established connection to network.");
     }
 
-    ext_shared_state.lock().await.on_connected();
+    println!("Established connection with {}.", &addr);
+    ext_shared_state.lock().await.on_connected(addr);
     Ok(())
 }
 

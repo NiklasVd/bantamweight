@@ -71,6 +71,10 @@ impl BinaryStream {
         self.buffer.clone()
     }
 
+    pub fn get_buffer_vec_clone(&self) -> Vec<u8> {
+        self.buffer.clone().make_contiguous().to_vec()
+    }
+
     // Writing
 
     pub fn write_bool(&mut self, val: bool) -> io::Result<()> {
@@ -90,6 +94,10 @@ impl BinaryStream {
     }
 
     pub fn write_u128(&mut self, val: u128) -> io::Result<()> {
+        self.write_buffer(&val.to_le_bytes().to_vec())
+    }
+
+    pub fn write_i64(&mut self, val: i64) -> io::Result<()> {
         self.write_buffer(&val.to_le_bytes().to_vec())
     }
 
@@ -144,6 +152,11 @@ impl BinaryStream {
     pub fn read_u128(&mut self) -> io::Result<u128> {
         let bytes = collect_array(self.read_buffer(16)?);
         Ok(u128::from_le_bytes(bytes))
+    }
+
+    pub fn read_i64(&mut self) -> io::Result<i64> {
+        let bytes = collect_array(self.read_buffer(8)?);
+        Ok(i64::from_le_bytes(bytes))
     }
 
     pub fn read_string(&mut self) -> io::Result<String> {

@@ -2,10 +2,6 @@ use std::{collections::HashMap, error::Error, fmt, io::ErrorKind, net::SocketAdd
 use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::{TcpListener, TcpStream, tcp::ReadHalf}, sync::{mpsc, Mutex}, time::timeout};
 use crate::{AM, BantamPacketType, BinaryStream, ByePacket, DataPacket, HandshakePacket, HandshakeResponsePacket, PacketHeader, Serializable, SerializableSocketAddr};
 
-// Important detail
-// Average BrunoCoin BlockPacket is 164b (only coinbase).
-// BlockchainPacket with even just 10 packets is already > 1600b.
-// Other packets are merely ~5-30b, and are only sent irregularly.
 pub const TCP_STREAM_READ_BUFFER_SIZE: usize = 256;
 pub const TCP_STREAM_CONNECTION_TIMEOUT_SECS: u64 = 15;
 pub const TCP_STREAM_READ_TIMEOUT_SECS: u64 = 5;

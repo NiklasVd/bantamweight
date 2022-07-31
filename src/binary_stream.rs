@@ -210,6 +210,16 @@ impl BinaryStream {
         }
     }
 
+    pub fn write_buffer_slice(&mut self, bytes: &[u8]) -> io::Result<()> {
+        match self.mode {
+            BinaryStreamMode::Read => Err(Error::new(io::ErrorKind::PermissionDenied, "Stream is in read-only mode")),
+            BinaryStreamMode::Write => {
+                self.buffer.extend(bytes);
+                Ok(())
+            }
+        }
+    }
+
     pub fn read_buffer_single(&mut self) -> io::Result<u8> {
         match self.mode {
             BinaryStreamMode::Write => Err(Error::new(io::ErrorKind::PermissionDenied, "Stream is in writing mode")),
@@ -232,4 +242,6 @@ impl BinaryStream {
             }
         }
     }
+
+    // TODO: Read buffer slice
 }

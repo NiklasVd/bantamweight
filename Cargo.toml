@@ -1,7 +1,10 @@
 [package]
 name = "bantamweight"
+description = "A lightweight TCP-based network library. Does basic server-client networking and offers a basic protocol for easy communication."
+keywords = ["network", "tcp", "communication"]
+categories = ["network programming", "networking"]
 version = "0.1.0"
-authors = ["Niklas Vd <niklas.vd123@gmail.com>"]
+authors = ["Niklas Vd"]
 edition = "2018"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html

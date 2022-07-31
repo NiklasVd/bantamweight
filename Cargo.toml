@@ -3,6 +3,7 @@ name = "bantamweight"
 description = "A lightweight TCP-based network library. Does basic server-client networking and offers a basic protocol for easy communication."
 keywords = ["network", "tcp", "communication"]
 categories = ["network programming", "networking"]
+license = "GPL-3.0"
 version = "0.1.0"
 authors = ["Niklas Vd"]
 edition = "2018"

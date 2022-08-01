@@ -4,7 +4,7 @@ description = "A lightweight TCP-based network library. Does basic server-client
 keywords = ["network", "tcp", "communication"]
 categories = ["network-programming"]
 license = "GPL-3.0"
-version = "0.1.1"
+version = "0.1.2"
 authors = ["Niklas Vd"]
 edition = "2018"
 

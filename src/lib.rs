@@ -1,4 +1,3 @@
-mod binary_stream;
 mod packet;
 mod peer;
 mod util;
@@ -6,7 +5,6 @@ mod util;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-pub use binary_stream::*;
 pub use packet::*;
 pub use peer::*;
 pub use util::*;
@@ -16,7 +14,9 @@ type AM<T> = Arc<Mutex<T>>;
 #[cfg(test)]
 mod tests {
     use std::{net::{Ipv6Addr, SocketAddr, SocketAddrV6}};
-    use crate::{BinaryStream, HandshakeResponsePacket, Serializable, SerializableSocketAddr};
+    use plain_binary_stream::{BinaryStream, Serializable};
+
+    use crate::{HandshakeResponsePacket, SerializableSocketAddr};
 
     #[derive(Debug, Default, PartialEq)]
     struct Alpha(u32, Vec<u8>);

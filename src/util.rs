@@ -1,6 +1,6 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 
-use crate::{BinaryStream, Serializable};
+use plain_binary_stream::{Serializable, BinaryStream};
 
 #[derive(Debug, PartialEq)]
 pub struct SerializableSocketAddr {

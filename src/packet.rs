@@ -1,14 +1,5 @@
-use crate::{BinaryStream, SerializableSocketAddr};
-
-pub trait PacketType : Sized {
-    fn to_byte(&self) -> u8;
-    fn from_byte(byte: u8) -> Option<Self>;
-}
-
-pub trait Serializable {
-    fn to_stream(&self, stream: &mut BinaryStream);
-    fn from_stream(stream: &mut BinaryStream) -> Self;
-}
+use plain_binary_stream::{Serializable, BinaryStream, PacketType};
+use crate::{SerializableSocketAddr};
 
 pub trait PacketHeader<T: PacketType> {
     fn get_type(&self) -> T;

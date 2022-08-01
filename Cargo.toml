@@ -12,3 +12,4 @@ edition = "2018"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
+plain-binary-stream = "0.1.0"

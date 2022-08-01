@@ -1,6 +1,7 @@
 use std::{collections::HashMap, error::Error, fmt, io::ErrorKind, net::SocketAddr, sync::Arc, time::Duration};
+use plain_binary_stream::{BinaryStream, Serializable};
 use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::{TcpListener, TcpStream, tcp::ReadHalf}, sync::{mpsc, Mutex}, time::timeout};
-use crate::{AM, BantamPacketType, BinaryStream, ByePacket, DataPacket, HandshakePacket, HandshakeResponsePacket, PacketHeader, Serializable, SerializableSocketAddr};
+use crate::{AM, BantamPacketType, ByePacket, DataPacket, HandshakePacket, HandshakeResponsePacket, PacketHeader, SerializableSocketAddr};
 
 pub const TCP_STREAM_READ_BUFFER_SIZE: usize = 256;
 pub const TCP_STREAM_CONNECTION_TIMEOUT_SECS: u64 = 15;
